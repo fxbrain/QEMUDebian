@@ -1,0 +1,142 @@
+name: Build Debian Rootfs
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  Build:
+    runs-on: ${{ matrix.config.os }}
+    name: ${{ matrix.config.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - {
+            os: ubuntu-latest,
+            suite: bullseye,
+            arch: armhf,
+            qemu-arch: "arm",
+            name: "Debian Bullseye armhf",
+            kernel: "linux-image-armmp",
+            artifacts: "bullseye-armhf-armmp",
+            hostname: "bullseye-armhf-armmp",
+            qcow2: "bullseye-armhf-armmp.qcow2",
+            rootfs: "bullseye-armhf-armmp-rootfs.tar.xz",
+            iface: "eth0",
+          }
+          - {
+            os: ubuntu-latest,
+            suite: bullseye,
+            arch: arm64,
+            qemu-arch: "aarch64",
+            name: "Debian Bullseye arm64",
+            kernel: "linux-image-arm64",
+            artifacts: "bullseye-arm64-arm64",
+            hostname: "bullseye-arm64-arm64",
+            qcow2: "bullseye-arm64-arm64.qcow2",
+            rootfs: "bullseye-arm64-arm64-rootfs.tar.xz",
+            iface: "eth0",
+          }
+    steps:
+    - uses: actions/checkout@v2
+
+    - name: Install dependencies
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y qemu-user-static libguestfs-tools linux-image-generic -y
+
+    - name: Debootstrap 1st stage
+      shell: bash
+      run: |
+        sudo mkdir mnt
+        sudo debootstrap --foreign --arch=${{ matrix.config.arch }} --include=locales ${{ matrix.config.suite }} mnt/ http://deb.debian.org/debian
+
+    - name: Debootstrap 2nd stage
+      shell: bash
+      run: |
+        sudo cp $(which qemu-${{ matrix.config.qemu-arch }}-static) mnt/usr/bin/
+        sudo chroot mnt/ debootstrap/debootstrap --second-stage
+    
+    - name: Install kernel and fstab
+      shell: bash
+      run: |
+        sudo bash -c "echo 'fake /usr ext4 fake 0 1' > mnt/etc/fstab"
+        sudo chroot mnt/ apt update && sudo chroot mnt/ apt install ${{ matrix.config.kernel }} -y
+        sudo bash -c "echo '/dev/sda / ext4 errors=remount-ro 0 1' > mnt/etc/fstab"
+
+    - name: Install SSH
+      shell: bash
+      run: |
+        sudo chroot mnt/ apt install openssh-server -y
+
+    - name: 'Configure Debian'
+      shell: bash
+      run: |
+        sudo bash -c "ls -lha mnt/etc/network/"
+        sudo bash -c "echo >> mnt/etc/network/interfaces"
+        sudo bash -c "echo 'auto ${{ matrix.config.iface }}' >> mnt/etc/network/interfaces"
+        sudo bash -c "echo 'iface ${{ matrix.config.iface }} inet dhcp' >> mnt/etc/network/interfaces"
+
+        sudo bash -c "cat /dev/null > mnt/etc/machine-id"
+        sudo bash -c "echo ${{ matrix.config.hostname }} > mnt/etc/hostname"
+
+        # sudo chroot mnt bash -c 'echo "debian:debian" | chpasswd'
+        sudo chroot mnt bash -c "adduser --disabled-password --gecos '' debian"
+        sudo chroot mnt bash -c 'echo "root:root" | chpasswd'
+        sudo chroot mnt bash -c 'echo "debian:debian" | chpasswd'
+
+    - name: 'Remove QEMU'
+      shell: bash
+      run: |
+        sudo rm /usr/bin/qemu-${{ matrix.config.qemu-arch }}-static
+
+    - name: 'Pack qcow2'
+      shell: bash
+      run: |
+        mkdir artifact
+        sudo virt-make-fs --type=ext4 --size=5G mnt raw.img
+        qemu-img convert -c -f raw -O qcow2 raw.img artifact/${{ matrix.config.qcow2 }}
+
+    - name: 'Pack Initrd & Kernel'
+      shell: bash
+      run: |
+        sudo cp mnt/boot/vmlinu* ./artifact/
+        sudo cp mnt/boot/initrd.img-* ./artifact/
+
+    - name: 'Pack Rootfs'
+      shell: bash
+      run: |
+        ls -la .
+        ls -la artifact/
+        sudo tar caf artifact/${{ matrix.config.rootfs }} --one-file-system mnt
+
+    - name: 'Upload artifact'
+      uses: actions/upload-artifact@v2
+      with:
+        path: ./artifact/
+        name: artifact
+
+  Publish:
+    needs: [Build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v2
+        with:
+          name: artifact
+          path: artifact
+
+      - name: Check artifacts
+        run: |
+          ls -la .
+          ls -la artifact/
+      
+      - name: 'Release'
+        if: startsWith(github.ref, 'refs/tags')
+        uses: softprops/action-gh-release@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          files: ./artifact/*
